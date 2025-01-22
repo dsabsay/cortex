@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -3266,4 +3268,94 @@ func TestUpdateMetricsWithRemoval(t *testing.T) {
 		ring_tokens_total{name="test"} 2
 	`))
 	assert.NoError(t, err)
+}
+
+func TestRing_Get_Consistency_flaky(t *testing.T) {
+	totalTests := 4000000
+	var wg sync.WaitGroup
+
+	numCores := runtime.NumCPU()
+	t.Logf("Running %d tests on %d cores", totalTests, numCores)
+	for i := 0; i < numCores; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_do_TestRing_Get_Consistency_flaky(t, int(math.Ceil(float64(totalTests)/float64(numCores))))
+		}()
+	}
+	wg.Wait()
+}
+
+func _do_TestRing_Get_Consistency_flaky(t *testing.T, testCount int) {
+	tests := map[string]struct {
+		initialInstances  int
+		addedInstances    int
+		removedInstances  int
+		numZones          int
+		replicationFactor int
+		numDiff           int
+	}{
+		"replication set should not change if ring did not change, when num of instance per zone is inconsistent": {
+			initialInstances:  11,
+			addedInstances:    0,
+			removedInstances:  0,
+			numZones:          3,
+			replicationFactor: 8,
+			numDiff:           0,
+		},
+	}
+
+	g := NewRandomTokenGenerator()
+	for testName, testData := range tests {
+		t.Run(testName, func(t *testing.T) {
+			testValues := g.GenerateTokens(NewDesc(), "", "", testCount, true)
+			bufDescs, bufHosts, bufZones := MakeBuffersForGet()
+			for i := 0; i < testCount; i++ {
+				ringDesc := &Desc{Ingesters: generateRingInstances(testData.initialInstances, testData.numZones, 128)}
+				ring := Ring{
+					cfg: Config{
+						HeartbeatTimeout:     time.Hour,
+						ZoneAwarenessEnabled: true,
+						ReplicationFactor:    testData.replicationFactor,
+					},
+					ringDesc:            ringDesc,
+					ringTokens:          ringDesc.GetTokens(),
+					ringTokensByZone:    ringDesc.getTokensByZone(),
+					ringInstanceByToken: ringDesc.getTokensInfo(),
+					ringZones:           getZones(ringDesc.getTokensByZone()),
+					strategy:            NewDefaultReplicationStrategy(),
+					KVClient:            &MockClient{},
+				}
+
+				set, err := ring.Get(testValues[i], Write, bufDescs, bufHosts, bufZones)
+				assert.NoError(t, err)
+				assert.Equal(t, testData.replicationFactor, len(set.Instances))
+
+				for i := 0; i < testData.addedInstances; i++ {
+					newID, newDesc := generateRingInstance(testData.initialInstances+i+1, 0, 128)
+					ringDesc.Ingesters[newID] = newDesc
+				}
+				for i := 0; i < testData.removedInstances; i++ {
+					delete(ringDesc.Ingesters, fmt.Sprintf("instance-%d", i))
+				}
+
+				ring.ringTokens = ringDesc.GetTokens()
+				ring.ringTokensByZone = ringDesc.getTokensByZone()
+				ring.ringInstanceByToken = ringDesc.getTokensInfo()
+				ring.ringZones = getZones(ringDesc.getTokensByZone())
+
+				newSet, err := ring.Get(testValues[i], Write, bufDescs, bufHosts, bufZones)
+				assert.NoError(t, err)
+				assert.Equal(t, testData.replicationFactor, len(newSet.Instances))
+
+				numDiff := 0
+				for _, desc := range newSet.Instances {
+					if !set.Includes(desc.Addr) {
+						numDiff++
+					}
+				}
+				assert.LessOrEqual(t, numDiff, testData.numDiff)
+			}
+		})
+	}
 }
